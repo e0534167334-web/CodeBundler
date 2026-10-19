@@ -86,7 +86,6 @@ internal static class ResponseFileService
 
         return new BundleOptions(
             Languages: languages,
-            InputPath: inputPath,
             OutputPath: output,
             IncludeSourceNotes: note,
             SortBy: sort,
@@ -103,8 +102,7 @@ internal static class ResponseFileService
             "bundle",
             "--language",
             string.Join(',', options.Languages),
-            "--input",
-            options.InputPath,
+
             "--output",
             options.OutputPath,
             "--sort",
