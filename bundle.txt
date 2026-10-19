@@ -1,0 +1,808 @@
+namespace CodeBundler;
+
+internal sealed record BundleOptions(
+    IReadOnlyList<string> Languages,
+    string InputPath,
+    string OutputPath,
+    bool IncludeSourceNotes,
+    string SortBy,
+    bool RemoveEmptyLines,
+    string? Author=null);
+
+using System.Text;
+
+namespace CodeBundler;
+
+internal static class BundleService
+{
+    private static readonly HashSet<string> ExcludedDirectories =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "bin", "obj", "debug", "release",
+            ".git", ".vs", ".idea",
+            "node_modules", "packages", "publish",
+            "dist", "coverage"
+        };
+
+    public static async Task<string> CreateAsync(
+        BundleOptions options)
+    {
+        var root = Directory.GetCurrentDirectory();
+
+        var outputPath = Path.GetFullPath(
+            options.OutputPath, root);
+
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+
+        if (string.IsNullOrWhiteSpace(outputDirectory) ||
+            !Directory.Exists(outputDirectory))
+        {
+            throw new CliException(
+                $"תיקיית היעד אינה קיימת: {outputDirectory}");
+        }
+
+        var files = EnumerateCodeFiles(root)
+            .Where(path => !Path.GetFullPath(path).Equals(
+                outputPath,
+                StringComparison.OrdinalIgnoreCase))
+            .Where(path => LanguageCatalog.IsCodeFile(
+                path, options.Languages))
+            .ToList();
+
+        if (options.SortBy == "type")
+        {
+            files = files
+                .OrderBy(
+                    LanguageCatalog.GetLanguageForExtension,
+                    StringComparer.OrdinalIgnoreCase)
+                .ThenBy(
+                    Path.GetFileName,
+                    StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        else
+        {
+            files = files
+                .OrderBy(
+                    Path.GetFileName,
+                    StringComparer.OrdinalIgnoreCase)
+                .ThenBy(
+                    path => path,
+                    StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        if (files.Count == 0)
+        {
+            throw new CliException(
+                "לא נמצאו קובצי קוד תואמים " +
+                "בתיקייה הנוכחית ובתיקיות המשנה.");
+        }
+
+        var tempPath = Path.Combine(
+            outputDirectory,
+            $".{Path.GetFileName(outputPath)}." +
+            $"{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            await using (var stream = new FileStream(
+                tempPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None))
+            await using (var writer = new StreamWriter(
+                stream, new UTF8Encoding(false)))
+            {
+                if (!string.IsNullOrWhiteSpace(options.Author))
+                {
+                    await writer.WriteLineAsync(
+                        $"// Author: {options.Author}");
+
+                    await writer.WriteLineAsync();
+                }
+
+                foreach (var file in files)
+                {
+                    var relativePath =
+                        Path.GetRelativePath(root, file)
+                            .Replace('\\', '/');
+
+                    if (options.IncludeSourceNotes)
+                    {
+                        await writer.WriteLineAsync(
+                            $"// Source: {relativePath}");
+                    }
+
+                    var lines = await File.ReadAllLinesAsync(file);
+
+                    foreach (var line in lines)
+                    {
+                        if (options.RemoveEmptyLines &&
+                            string.IsNullOrWhiteSpace(line))
+                        {
+                            continue;
+                        }
+
+                        await writer.WriteLineAsync(line);
+                    }
+
+                    await writer.WriteLineAsync();
+                }
+            }
+
+            // מחליפים את קובץ היעד רק לאחר שהכתיבה הושלמה.
+            File.Move(tempPath, outputPath, overwrite: true);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            throw new CliException(
+                $"אין הרשאה לכתוב לקובץ: {outputPath}");
+        }
+        catch (IOException ex)
+        {
+            throw new CliException(
+                $"לא ניתן לשמור את קובץ ה-bundle: {ex.Message}");
+        }
+        finally
+        {
+            // ניקוי קובץ זמני אם הכתיבה או ההחלפה נכשלו.
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch (IOException)
+            {
+                // כישלון בניקוי לא משנה את תוצאת האריזה.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // אין הרשאה למחוק את הקובץ הזמני.
+            }
+        }
+
+        return outputPath;
+    }
+
+    private static IEnumerable<string> EnumerateCodeFiles(
+        string root)
+    {
+        var pending = new Stack<string>();
+        pending.Push(root);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            string[] entries;
+
+            try
+            {
+                entries = Directory
+                    .EnumerateFileSystemEntries(current)
+                    .ToArray();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                continue;
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            foreach (var entry in entries)
+            {
+                if (Directory.Exists(entry))
+                {
+                    var name = Path.GetFileName(entry);
+
+                    if (!ExcludedDirectories.Contains(name))
+                        pending.Push(entry);
+                }
+                else
+                {
+                    yield return entry;
+                }
+            }
+        }
+    }
+}
+
+using System.Text;
+
+namespace CodeBundler;
+
+internal static class CliApplication
+{
+    public static async Task<int> RunAsync(
+        string[] rawArgs)
+    {
+        try
+        {
+            var args =
+                ResponseFileService.ExpandArguments(rawArgs);
+
+            if (args.Length == 0 ||
+                args[0] is "--help" or "-h" or "help")
+            {
+                PrintHelp();
+                return 0;
+            }
+
+            return args[0].ToLowerInvariant() switch
+            {
+                "bundle" =>
+                    await RunBundleAsync(args[1..]),
+
+                "create-rsp" =>
+                    CreateResponseFile(),
+
+                _ => UnknownCommand(args[0])
+            };
+        }
+        catch (CliException ex)
+        {
+            Console.Error.WriteLine($"שגיאה: {ex.Message}");
+            return 2;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"שגיאה לא צפויה: {ex.Message}");
+
+            return 1;
+        }
+    }
+
+    private static async Task<int> RunBundleAsync(
+        string[] args)
+    {
+        var options = CliParser.ParseBundleOptions(args);
+        var result = await BundleService.CreateAsync(options);
+
+        Console.WriteLine(
+            $"האריזה הושלמה בהצלחה: {result}");
+
+        return 0;
+    }
+
+    private static int CreateResponseFile()
+    {
+        var options = ResponseFileService.AskForOptions();
+
+        var path = Path.GetFullPath("bundle.rsp");
+
+        File.WriteAllLines(
+            path,
+            ResponseFileService.BuildResponseArguments(options),
+            new UTF8Encoding(false));
+
+        Console.WriteLine($"קובץ תגובה נוצר: {path}");
+        Console.WriteLine("להרצה: codebundler @bundle.rsp");
+
+        return 0;
+    }
+
+    private static int UnknownCommand(string command)
+    {
+        Console.Error.WriteLine(
+            $"פקודה לא מוכרת: {command}");
+
+        PrintHelp();
+        return 2;
+    }
+
+    private static void PrintHelp()
+    {
+        Console.WriteLine("""
+        CodeBundler - אריזת קובצי קוד לקובץ אחד
+
+        פקודות:
+          bundle       אריזת קובצי קוד
+          create-rsp   יצירת קובץ תגובה
+          help         הצגת העזרה
+
+        אפשרויות:
+          --language, -l              חובה: שפות או all
+          --output, -o                שם קובץ או נתיב
+          --note, -n                  הערת מקור
+          --sort, -s                  name או type
+          --remove-empty-lines, -e    הסרת שורות ריקות
+          --author, -a                שם היוצר
+
+        דוגמאות:
+          codebundler bundle -l csharp -o bundle.txt
+          codebundler bundle -l all -o bundle.txt -n
+          codebundler @bundle.rsp
+        """);
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+namespace CodeBundler;
+
+/// <summary>
+/// שגיאה צפויה שניתן להציג למשתמש בצורה ידידותית.
+/// </summary>
+internal sealed class CliException(string message) : Exception(message);
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CodeBundler;
+
+internal static class CliParser
+{
+    public static BundleOptions ParseBundleOptions(string[] args)
+    {
+        var values = new Dictionary<string, string?>(
+            StringComparer.OrdinalIgnoreCase);
+
+        var flags = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase);
+
+        var valueOptions = new Dictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            ["--language"] = "language",
+            ["-l"] = "language",
+            ["--output"] = "output",
+            ["-o"] = "output",
+            ["--sort"] = "sort",
+            ["-s"] = "sort",
+            ["--author"] = "author",
+            ["-a"] = "author"
+        };
+
+        var flagOptions = new Dictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            ["--note"] = "note",
+            ["-n"] = "note",
+            ["--remove-empty-lines"] = "remove-empty-lines",
+            ["-e"] = "remove-empty-lines"
+        };
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+
+            if (flagOptions.TryGetValue(token, out var flag))
+            {
+                if (!flags.Add(flag))
+                    throw new CliException(
+                        $"האפשרות {token} הוגדרה יותר מפעם אחת.");
+
+                continue;
+            }
+
+            if (!valueOptions.TryGetValue(token, out var key))
+                throw new CliException(
+                    $"אפשרות לא מוכרת: {token}. הריצי codebundler help.");
+
+            if (i + 1 >= args.Length ||
+                args[i + 1].StartsWith('-'))
+            {
+                throw new CliException(
+                    $"חסר ערך עבור {token}.");
+            }
+
+            var value = args[++i].Trim();
+
+            if (value.Length == 0)
+                throw new CliException(
+                    $"הערך של {token} אינו יכול להיות ריק.");
+
+            if (!values.TryAdd(key, value))
+                throw new CliException(
+                    $"האפשרות {token} הוגדרה יותר מפעם אחת.");
+
+        }
+
+        if (!values.TryGetValue("language", out var languageText))
+            throw new CliException(
+                "האפשרות --language (-l) היא חובה.");
+
+        string[] languages;
+
+        if (languageText!.Equals(
+                "all", StringComparison.OrdinalIgnoreCase))
+        {
+            languages = new[] { "all" };
+        }
+        else
+        {
+            languages = languageText
+                .Split(',', StringSplitOptions.TrimEntries |
+                               StringSplitOptions.RemoveEmptyEntries)
+                .Select(LanguageCatalog.NormalizeLanguage)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (languages.Length == 0)
+                throw new CliException(
+                    "יש לציין לפחות שפה אחת או all.");
+        }
+
+        var sort = values.GetValueOrDefault("sort") ?? "name";
+
+        sort = sort.ToLowerInvariant() switch
+        {
+            "name" => "name",
+            "type" => "type",
+            _ => throw new CliException(
+                "ערך sort לא תקין. יש לבחור name או type.")
+        };
+
+        var output = values.GetValueOrDefault("output")
+                     ?? "bundle.txt";
+
+        var author = values.GetValueOrDefault("author");
+
+        if (author is not null &&
+            author.Any(char.IsControl))
+        {
+            throw new CliException(
+                "שם היוצר מכיל תווים לא תקינים.");
+        }
+
+        return new BundleOptions(
+            languages,
+            output,
+            flags.Contains("note"),
+            sort,
+            flags.Contains("remove-empty-lines"),
+            author);
+    }
+}
+
+namespace CodeBundler;
+
+internal static class LanguageCatalog
+{
+    private static readonly Dictionary<string, string[]> Extensions =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["csharp"] = [".cs"],
+            ["c#"] = [".cs"],
+            ["python"] = [".py"],
+            ["java"] = [".java"],
+            ["javascript"] = [".js", ".mjs", ".cjs"],
+            ["typescript"] = [".ts", ".tsx"],
+            ["cpp"] = [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
+            ["c"] = [".c", ".h"],
+            ["html"] = [".html", ".htm"],
+            ["css"] = [".css"],
+            ["sql"] = [".sql"],
+            ["json"] = [".json"],
+            ["xml"] = [".xml"],
+            ["go"] = [".go"],
+            ["rust"] = [".rs"],
+            ["php"] = [".php"],
+            ["ruby"] = [".rb"],
+            ["swift"] = [".swift"],
+            ["kotlin"] = [".kt", ".kts"],
+            ["powershell"] = [".ps1"],
+            ["bash"] = [".sh"]
+        };
+
+    public static string NormalizeLanguage(string value)
+    {
+        var key = value.Trim().ToLowerInvariant();
+
+        if (!Extensions.ContainsKey(key))
+        {
+            throw new CliException(
+                $"שפה לא נתמכת: '{value}'. " +
+                "בדקי את שם השפה או השתמשי ב-all.");
+        }
+
+        return key;
+    }
+
+    public static bool IsCodeFile(
+        string path,
+        IReadOnlyList<string> languages)
+    {
+        var extension = Path.GetExtension(path);
+
+        if (languages.Contains(
+                "all", StringComparer.OrdinalIgnoreCase))
+        {
+            return Extensions.Values
+                .SelectMany(items => items)
+                .Contains(extension,
+                    StringComparer.OrdinalIgnoreCase);
+        }
+
+        return languages
+            .SelectMany(language => Extensions[language])
+            .Contains(extension,
+                StringComparer.OrdinalIgnoreCase);
+    }
+
+    public static string GetLanguageForExtension(string path)
+    {
+        var extension = Path.GetExtension(path);
+
+        return Extensions
+            .FirstOrDefault(pair =>
+                pair.Value.Contains(
+                    extension,
+                    StringComparer.OrdinalIgnoreCase))
+            .Key ?? "unknown";
+    }
+}
+
+using CodeBundler;
+
+return await CliApplication.RunAsync(args);
+
+using System.Text;
+
+namespace CodeBundler;
+
+internal static class ResponseFileService
+{
+    public static string[] ExpandArguments(string[] args)
+    {
+        // מפעילים קובץ תגובה כאשר הוא הארגומנט היחיד.
+        if (args.Length == 1 &&
+            args[0].StartsWith('@') &&
+            args[0].Length > 1)
+        {
+            var path = Path.GetFullPath(args[0][1..]);
+
+            if (!File.Exists(path))
+            {
+                throw new CliException(
+                    $"קובץ התגובה לא נמצא: {path}");
+            }
+
+            return TokenizeResponseFile(
+                File.ReadAllText(path));
+        }
+
+        return args;
+    }
+
+    public static BundleOptions AskForOptions()
+    {
+        Console.WriteLine("יצירת קובץ תגובה לפקודת bundle");
+        Console.WriteLine();
+
+        string language;
+        string[] languages;
+
+        while (true)
+        {
+            language = AskRequired(
+                "שפות (למשל csharp,python או all)");
+
+            try
+            {
+                languages = language.Equals(
+                    "all", StringComparison.OrdinalIgnoreCase)
+                    ? new[] { "all" }
+                    : language.Split(
+                            ',',
+                            StringSplitOptions.TrimEntries |
+                            StringSplitOptions.RemoveEmptyEntries)
+                        .Select(LanguageCatalog.NormalizeLanguage)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+
+                if (languages.Length == 0)
+                    throw new CliException(
+                        "יש לציין לפחות שפה אחת או all.");
+
+                break;
+            }
+            catch (CliException ex)
+            {
+                Console.WriteLine($"שגיאה: {ex.Message}");
+            }
+        }
+
+        var inputPath = AskRequired(
+            "נתיב קלט לסריקת קבצים");
+
+        var output = AskRequired(
+            "שם קובץ הפלט או נתיב מלא");
+
+        var note = AskYesNo(
+            "להוסיף הערת מקור לכל קובץ?");
+
+        var sort = AskChoice(
+            "סדר מיון",
+            ["name", "type"],
+            "name");
+
+        var removeEmpty = AskYesNo(
+            "להסיר שורות ריקות?");
+
+        var author = AskOptional(
+            "שם היוצר (אפשר להשאיר ריק)");
+
+        return new BundleOptions(
+            Languages: languages,
+            InputPath: inputPath,
+            OutputPath: output,
+            IncludeSourceNotes: note,
+            SortBy: sort,
+            RemoveEmptyLines: removeEmpty,
+            Author: string.IsNullOrWhiteSpace(author) ? null : author
+        );
+    }
+
+    public static string[] BuildResponseArguments(
+        BundleOptions options)
+    {
+        var args = new List<string>
+        {
+            "bundle",
+            "--language",
+            string.Join(',', options.Languages),
+            "--input",
+            options.InputPath,
+            "--output",
+            options.OutputPath,
+            "--sort",
+            options.SortBy
+        };
+
+        if (options.IncludeSourceNotes)
+            args.Add("--note");
+
+        if (options.RemoveEmptyLines)
+            args.Add("--remove-empty-lines");
+
+        if (!string.IsNullOrWhiteSpace(options.Author))
+        {
+            args.Add("--author");
+            args.Add(options.Author);
+        }
+
+        return args.Select(QuoteIfNeeded).ToArray();
+    }
+
+    private static string QuoteIfNeeded(string value)
+    {
+        if (!value.Any(char.IsWhiteSpace) &&
+            !value.Contains('"'))
+        {
+            return value;
+        }
+
+        return "\"" +
+               value.Replace("\\", "\\\\")
+                    .Replace("\"", "\\\"") +
+               "\"";
+    }
+
+    private static string[] TokenizeResponseFile(
+        string content)
+    {
+        var tokens = new List<string>();
+        var current = new StringBuilder();
+        var inQuotes = false;
+        var escaping = false;
+
+        foreach (var ch in content)
+        {
+            if (escaping)
+            {
+                current.Append(ch);
+                escaping = false;
+            }
+            else if (ch == '\\' && inQuotes)
+            {
+                escaping = true;
+            }
+            else if (ch == '"')
+            {
+                inQuotes = !inQuotes;
+            }
+            else if (char.IsWhiteSpace(ch) && !inQuotes)
+            {
+                if (current.Length > 0)
+                {
+                    tokens.Add(current.ToString());
+                    current.Clear();
+                }
+            }
+            else
+            {
+                current.Append(ch);
+            }
+        }
+
+        if (escaping)
+            current.Append('\\');
+
+        if (inQuotes)
+            throw new CliException(
+                "קובץ התגובה מכיל מרכאות לא סגורות.");
+
+        if (current.Length > 0)
+            tokens.Add(current.ToString());
+
+        return tokens.ToArray();
+    }
+
+    private static string AskRequired(string question)
+    {
+        while (true)
+        {
+            Console.Write($"{question}: ");
+            var answer = Console.ReadLine()?.Trim();
+
+            if (!string.IsNullOrWhiteSpace(answer))
+                return answer;
+
+            Console.WriteLine("הערך נדרש.");
+        }
+    }
+
+    private static string AskOptional(string question)
+    {
+        Console.Write($"{question}: ");
+        return Console.ReadLine()?.Trim() ?? "";
+    }
+
+    private static bool AskYesNo(string question)
+    {
+        while (true)
+        {
+            Console.Write($"{question} (y/n): ");
+
+            var answer = Console.ReadLine()?
+                .Trim().ToLowerInvariant();
+
+            if (answer is "y" or "yes" or "כן")
+                return true;
+
+            if (answer is "n" or "no" or "לא")
+                return false;
+
+            Console.WriteLine("נא לענות y או n.");
+        }
+    }
+
+    private static string AskChoice(
+        string question,
+        string[] choices,
+        string defaultValue)
+    {
+        while (true)
+        {
+            Console.Write(
+                $"{question} ({string.Join("/", choices)}) " +
+                $"[{defaultValue}]: ");
+
+            var answer = Console.ReadLine()?.Trim();
+
+            if (string.IsNullOrEmpty(answer))
+                return defaultValue;
+
+            if (choices.Contains(
+                answer, StringComparer.OrdinalIgnoreCase))
+            {
+                return answer.ToLowerInvariant();
+            }
+
+            Console.WriteLine(
+                $"ערך לא תקין. האפשרויות: " +
+                $"{string.Join(", ", choices)}.");
+        }
+    }
+}
+
